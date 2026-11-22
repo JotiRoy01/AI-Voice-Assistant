@@ -1,0 +1,172 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: flowmind-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-flowmind_voice}
+      MYSQL_USER: ${MYSQL_USER:-flowmind}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-flowmind_secret_password}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-flowmind_root_password}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./services/backend/migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-flowmind_root_password}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: flowmind-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  tts:
+    build:
+      context: ./services/tts
+      dockerfile: Dockerfile
+    container_name: flowmind-tts
+    restart: unless-stopped
+    environment:
+      TTS_CACHE_DIR: /data/audio-cache
+      TTS_DEFAULT_VOICE: ${TTS_DEFAULT_VOICE:-bn-BD-NabanitaNeural}
+    ports:
+      - "8000:8000"
+    volumes:
+      - tts_cache:/data/audio-cache
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  n8n:
+    image: n8nio/n8n:1.76.1
+    container_name: flowmind-n8n
+    restart: unless-stopped
+    environment:
+      N8N_HOST: localhost
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      GENERIC_TIMEZONE: Asia/Dhaka
+      TZ: Asia/Dhaka
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-flowmind-n8n-encryption-key-change-me}
+      FLOWMIND_API_URL: http://backend:4000
+      FLOWMIND_INTERNAL_TOKEN: ${INTERNAL_SERVICE_TOKEN:-flowmind-internal-service-token-change-me}
+      FLOWMIND_TTS_URL: http://tts:8000
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n/workflows:/workflows:ro
+    depends_on:
+      - backend
+      - tts
+
+  backend:
+    build:
+      context: ./services/backend
+      dockerfile: Dockerfile
+    container_name: flowmind-backend
+    restart: unless-stopped
+    env_file:
+      - .env.example
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 4000
+      DATA_STORE: mysql
+      QUEUE_MODE: bullmq
+      MYSQL_HOST: mysql
+      REDIS_HOST: redis
+      TTS_SERVICE_URL: http://tts:8000
+      N8N_WEBHOOK_URL: http://n8n:5678/webhook/flowmind-call-trigger
+      PUBLIC_CALLBACK_BASE_URL: http://backend:4000
+    ports:
+      - "4000:4000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      tts:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ./services/backend
+      dockerfile: Dockerfile
+    container_name: flowmind-worker
+    restart: unless-stopped
+    command: ["node", "dist/worker.js"]
+    env_file:
+      - .env.example
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      DATA_STORE: mysql
+      QUEUE_MODE: bullmq
+      MYSQL_HOST: mysql
+      REDIS_HOST: redis
+      TTS_SERVICE_URL: http://tts:8000
+      N8N_WEBHOOK_URL: http://n8n:5678/webhook/flowmind-call-trigger
+      PUBLIC_CALLBACK_BASE_URL: http://backend:4000
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      tts:
+        condition: service_healthy
+
+  dashboard:
+    build:
+      context: ./services/dashboard
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:4000}
+    container_name: flowmind-dashboard
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:4000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+  # Optional profile: run with `docker compose --profile telephony up -d`
+  asterisk:
+    profiles: ["telephony"]
+    build:
+      context: ./asterisk
+      dockerfile: Dockerfile
+    container_name: flowmind-asterisk
+    restart: unless-stopped
+    environment:
+      FLOWMIND_BACKEND_URL: http://backend:4000
+      TELEPHONY_WEBHOOK_SECRET: ${TELEPHONY_WEBHOOK_SECRET:-telephony-callback-hmac-secret}
+    ports:
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+      - "8088:8088"
+    volumes:
+      - tts_cache:/var/lib/asterisk/sounds/flowmind:ro
+    depends_on:
+      - backend
+
+volumes:
+  mysql_data:
+  redis_data:
+  n8n_data:
+  tts_cache:

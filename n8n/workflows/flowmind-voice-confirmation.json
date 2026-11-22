@@ -1,0 +1,194 @@
+{
+  "name": "FlowMind AI — Voice Order Confirmation (SRS v1.0)",
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "timezone": "Asia/Dhaka"
+  },
+  "nodes": [
+    {
+      "id": "node-webhook-trigger",
+      "name": "1. Authenticated Call Job Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [220, 300],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "flowmind-call-trigger",
+        "responseMode": "onReceived",
+        "responseData": "firstEntryJson"
+      }
+    },
+    {
+      "id": "node-validate-token",
+      "name": "2. Verify Internal Service Token",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [460, 300],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.headers['x-internal-token'] }}",
+              "operation": "equals",
+              "value2": "={{ $env.FLOWMIND_INTERNAL_TOKEN }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "node-fetch-order",
+      "name": "3. Fetch Authoritative Order from Node.js",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 260],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.FLOWMIND_API_URL + '/api/internal/orders/' + $json.body.orderId }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Internal-Token",
+              "value": "={{ $env.FLOWMIND_INTERNAL_TOKEN }}"
+            }
+          ]
+        },
+        "options": {
+          "retry": {
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      }
+    },
+    {
+      "id": "node-check-eligibility",
+      "name": "4. Check Eligibility & Calling Window",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [980, 260],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.eligibility.eligible }}",
+              "value2": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "node-generate-tts",
+      "name": "5. Generate or Retrieve Cached Bangla TTS",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1240, 220],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.FLOWMIND_TTS_URL + '/synthesize' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.prompt.fullScript, voice: $json.settings.voiceName, language: $json.settings.language, format: 'wav' }) }}",
+        "options": {
+          "retry": {
+            "maxTries": 3,
+            "waitBetweenTries": 3000
+          }
+        }
+      }
+    },
+    {
+      "id": "node-initiate-call",
+      "name": "6. Initiate Outbound Call via Node.js Telephony Adapter",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1520, 220],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.FLOWMIND_API_URL + '/api/internal/telephony/dial' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Internal-Token",
+              "value": "={{ $env.FLOWMIND_INTERNAL_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ tenantId: $('1. Authenticated Call Job Trigger').item.json.body.tenantId, orderId: $('1. Authenticated Call Job Trigger').item.json.body.orderId, callJobId: $('1. Authenticated Call Job Trigger').item.json.body.callJobId, audioUrl: $env.FLOWMIND_TTS_URL + $json.audio_url }) }}",
+        "options": {
+          "retry": {
+            "maxTries": 3,
+            "waitBetweenTries": 5000
+          }
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "node-dlq-report",
+      "name": "7. Report Permanent Failure to Dead-Letter Queue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 380],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.FLOWMIND_API_URL + '/api/internal/jobs/dlq' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Internal-Token",
+              "value": "={{ $env.FLOWMIND_INTERNAL_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ tenantId: $('1. Authenticated Call Job Trigger').item.json.body.tenantId, orderId: $('1. Authenticated Call Job Trigger').item.json.body.orderId, callJobId: $('1. Authenticated Call Job Trigger').item.json.body.callJobId, attemptNo: $('1. Authenticated Call Job Trigger').item.json.body.attemptNo, errorMessage: $json.error?.message || 'Telephony/TTS orchestration failure' }) }}"
+      }
+    }
+  ],
+  "connections": {
+    "1. Authenticated Call Job Trigger": {
+      "main": [
+        [{ "node": "2. Verify Internal Service Token", "type": "main", "index": 0 }]
+      ]
+    },
+    "2. Verify Internal Service Token": {
+      "main": [
+        [{ "node": "3. Fetch Authoritative Order from Node.js", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "3. Fetch Authoritative Order from Node.js": {
+      "main": [
+        [{ "node": "4. Check Eligibility & Calling Window", "type": "main", "index": 0 }]
+      ]
+    },
+    "4. Check Eligibility & Calling Window": {
+      "main": [
+        [{ "node": "5. Generate or Retrieve Cached Bangla TTS", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "5. Generate or Retrieve Cached Bangla TTS": {
+      "main": [
+        [{ "node": "6. Initiate Outbound Call via Node.js Telephony Adapter", "type": "main", "index": 0 }]
+      ]
+    },
+    "6. Initiate Outbound Call via Node.js Telephony Adapter": {
+      "main": [
+        [],
+        [{ "node": "7. Report Permanent Failure to Dead-Letter Queue", "type": "main", "index": 0 }]
+      ]
+    }
+  }
+}

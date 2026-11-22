@@ -1,0 +1,19 @@
+{
+  "name": "flowmind-ai-voice-confirmation",
+  "version": "1.0.0",
+  "private": true,
+  "description": "FlowMind AI — AI Voice Order Confirmation System (SRS v1.0)",
+  "scripts": {
+    "dev:backend": "npm --prefix services/backend run dev",
+    "dev:dashboard": "npm --prefix services/dashboard run dev",
+    "build:backend": "npm --prefix services/backend run build",
+    "build:dashboard": "npm --prefix services/dashboard run build",
+    "test:backend": "npm --prefix services/backend test",
+    "migrate": "npm --prefix services/backend run migrate",
+    "seed": "npm --prefix services/backend run seed",
+    "docker:up": "docker compose up --build -d",
+    "docker:up:telephony": "docker compose --profile telephony up --build -d",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f"
+  }
+}
