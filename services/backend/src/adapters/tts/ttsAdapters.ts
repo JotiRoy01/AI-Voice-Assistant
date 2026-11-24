@@ -24,7 +24,13 @@ async function synthesizeWithInstalledEdgeTtsCli(
     'import sys, asyncio, edge_tts; ' +
     'asyncio.run(edge_tts.Communicate(text=sys.argv[1], voice=sys.argv[2], rate="+0%").save(sys.argv[3]))';
 
-  for (const pyBin of ['C:\\anaconda3\\python.exe', 'python', 'py']) {
+  for (const pyBin of [
+    path.resolve(process.cwd(), '../../flowmind/python.exe'),
+    path.resolve(process.cwd(), 'flowmind/python.exe'),
+    'C:\\anaconda3\\python.exe',
+    'python',
+    'py',
+  ]) {
     try {
       await execFileAsync(pyBin, ['-c', pyScript, text, voice, outFilePath], {
         timeout: 12000,
@@ -366,6 +372,7 @@ export class LocalHttpTtsAdapter implements TtsAdapter {
    */
   readonly name = 'local_http';
   public readonly cacheDir: string;
+  private ttsServiceBackoffUntil = 0;
 
   constructor(
     private readonly baseUrl: string,
@@ -391,7 +398,7 @@ export class LocalHttpTtsAdapter implements TtsAdapter {
     const filePath = path.join(this.cacheDir, filename);
     const nodeServedAudioUrl = `${this.publicApiBaseUrl.replace(/\/$/, '')}/api/tts/audio/${filename}`;
 
-    // 1. Check local SHA-256 disk cache first
+    // 1. Check local SHA-256 disk cache first (~1ms)
     if (fs.existsSync(filePath) && fs.statSync(filePath).size > 256) {
       return {
         audioUrl: nodeServedAudioUrl,
@@ -401,18 +408,50 @@ export class LocalHttpTtsAdapter implements TtsAdapter {
       };
     }
 
-    // 2. Primary: Official `edge-tts` 7.3.1 Neural Bangladeshi Bangla (`bn-BD-PradeepNeural` / `bn-BD-NabanitaNeural`)
-    const cliOk = await synthesizeWithInstalledEdgeTtsCli(req.text, voice, filePath);
-    if (cliOk) {
-      return {
-        audioUrl: nodeServedAudioUrl,
-        cacheKey,
-        cached: false,
-        provider: `edge-neural-${voice}`,
-      };
+    // 2. Primary (Fastest): Persistent Python FastAPI TTS Microservice on port 8000 (stays warm in RAM, zero Python boot delay!)
+    const normalizedTtsBaseUrl = this.baseUrl
+      .replace(/\/$/, '')
+      .replace('://localhost:', '://127.0.0.1:');
+    if (Date.now() >= this.ttsServiceBackoffUntil) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      try {
+        const res = await fetch(`${normalizedTtsBaseUrl}/synthesize`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text: req.text,
+            voice,
+            language: req.language,
+            format,
+          }),
+          signal: controller.signal,
+        });
+        if (res.ok) {
+          const data = (await res.json()) as {
+            audio_url: string;
+            cache_key: string;
+            cached: boolean;
+            engine: string;
+          };
+          return {
+            audioUrl: data.audio_url.startsWith('http')
+              ? data.audio_url
+              : `${normalizedTtsBaseUrl}${data.audio_url}`,
+            cacheKey: data.cache_key,
+            cached: data.cached,
+            provider: `persistent-tts:${data.engine || this.name}`,
+          };
+        }
+      } catch {
+        // Back off probing port 8000 for 30s if the persistent TTS service is not running
+        this.ttsServiceBackoffUntil = Date.now() + 30_000;
+      } finally {
+        clearTimeout(timer);
+      }
     }
 
-    // 3. Secondary: Built-in Node.js Microsoft Edge Neural Bangladeshi Bangla TTS WebSocket
+    // 3. Secondary: Built-in Node.js Microsoft Edge Neural Bangladeshi Bangla TTS WebSocket (zero Python boot delay!)
     try {
       const mp3Buf = await synthesizeEdgeNeuralBanglaMp3(req.text, voice);
       fs.writeFileSync(filePath, mp3Buf);
@@ -425,63 +464,30 @@ export class LocalHttpTtsAdapter implements TtsAdapter {
     } catch (edgeErr) {
       logger.warn(
         { err: edgeErr instanceof Error ? edgeErr.message : String(edgeErr) },
-        'Edge Neural WebSocket unavailable; using built-in Google Bangla TTS stream'
+        'Edge Neural WebSocket unavailable; trying local edge-tts CLI fallback'
       );
     }
 
-    // 3. Try Built-in Google Bangla TTS stream in Node.js (100% pure Bangla pronunciation, zero Python required!)
-    try {
-      const gBuf = await synthesizeGoogleTranslateBanglaMp3(req.text);
-      fs.writeFileSync(filePath, gBuf);
+    // 4. Tertiary: Local `edge-tts` CLI fallback
+    const cliOk = await synthesizeWithInstalledEdgeTtsCli(req.text, voice, filePath);
+    if (cliOk) {
       return {
         audioUrl: nodeServedAudioUrl,
         cacheKey,
         cached: false,
-        provider: 'google-bangla-tts',
+        provider: `edge-neural-${voice}`,
       };
-    } catch (gErr) {
-      logger.warn(
-        { err: gErr instanceof Error ? gErr.message : String(gErr) },
-        'Google Bangla TTS failed; trying external Python TTS service on port 8000'
-      );
     }
 
-    // 4. Final fallback: External Python FastAPI TTS microservice on port 8000
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 12000);
-    try {
-      const res = await fetch(`${this.baseUrl.replace(/\/$/, '')}/synthesize`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: req.text,
-          voice,
-          language: req.language,
-          format,
-        }),
-        signal: controller.signal,
-      });
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`TTS service error (${res.status}): ${body}`);
-      }
-      const data = (await res.json()) as {
-        audio_url: string;
-        cache_key: string;
-        cached: boolean;
-        engine: string;
-      };
-      return {
-        audioUrl: data.audio_url.startsWith('http')
-          ? data.audio_url
-          : `${this.baseUrl.replace(/\/$/, '')}${data.audio_url}`,
-        cacheKey: data.cache_key,
-        cached: data.cached,
-        provider: data.engine || this.name,
-      };
-    } finally {
-      clearTimeout(timer);
-    }
+    // 5. Final fallback: Built-in Google Bangla TTS stream in Node.js
+    const gBuf = await synthesizeGoogleTranslateBanglaMp3(req.text);
+    fs.writeFileSync(filePath, gBuf);
+    return {
+      audioUrl: nodeServedAudioUrl,
+      cacheKey,
+      cached: false,
+      provider: 'google-bangla-tts',
+    };
   }
 }
 

@@ -17,11 +17,13 @@ import { CallQueueDriver, createCallQueue } from './queue/callQueue';
 import { createAuthRouter } from './routes/authRoutes';
 import { createConversationRouter } from './routes/conversationRoutes';
 import { createDashboardAndSimulatorRouters } from './routes/dashboardAndSimulatorRoutes';
+import { createRealtimeRouter } from './routes/realtimeRoutes';
 import { createVoiceAndOrderRouters } from './routes/voiceAndOrderRoutes';
 import { createWebhookRouter } from './routes/webhookRoutes';
 import { ConversationalAgentService } from './services/conversationalAgentService';
 import { DtmfCallbackService } from './services/dtmfCallbackService';
 import { OrderIntakeService } from './services/orderIntakeService';
+import { ProductCatalogRagService } from './services/productCatalogRagService';
 import { VoiceCallService } from './services/voiceCallService';
 import { WhatsAppService } from './services/whatsappService';
 import { logger } from './utils/logger';
@@ -85,11 +87,13 @@ export function createAppContainer(options: CreateAppOptions): AppContainer {
   const voiceCallService = new VoiceCallService(repo, ttsAdapter, telephonyAdapter, queue, env);
   const dtmfCallbackService = new DtmfCallbackService(repo, storeAdapters, whatsappAdapter, queue, env);
   const whatsappService = new WhatsAppService(repo);
+  const catalogRagService = new ProductCatalogRagService(env);
   const conversationalAgentService = new ConversationalAgentService(
     repo,
     ttsAdapter,
     dtmfCallbackService,
-    env
+    env,
+    catalogRagService
   );
 
   // 4. Start Background Queue Worker (listens for queued call jobs and triggers voiceCallService)
@@ -216,7 +220,11 @@ export function createAppContainer(options: CreateAppOptions): AppContainer {
   });
   app.use('/api/dashboard', dashboardRouter);
   app.use('/api/simulator', simulatorRouter);
-  app.use('/api/conversation', createConversationRouter({ conversationalAgentService, env }));
+  app.use(
+    '/api/conversation',
+    createConversationRouter({ conversationalAgentService, catalogRagService, env })
+  );
+  app.use('/api/realtime', createRealtimeRouter({ repo, storeAdapters, env }));
 
   // 8. Global Error Handler
   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {

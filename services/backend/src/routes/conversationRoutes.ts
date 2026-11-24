@@ -2,6 +2,10 @@ import express, { Router } from 'express';
 import { AppEnv } from '../config/env';
 import { requireAuth, resolveScopedTenantId } from '../security/auth';
 import { ConversationalAgentService } from '../services/conversationalAgentService';
+import {
+  ATTRIBUTE_BANGLA_LABELS,
+  ProductCatalogRagService,
+} from '../services/productCatalogRagService';
 import { DEMO_TENANT_A_ID } from '../db/seedData';
 
 function escapeXml(unsafe: string): string {
@@ -15,6 +19,7 @@ function escapeXml(unsafe: string): string {
 
 export function createConversationRouter(deps: {
   conversationalAgentService: ConversationalAgentService;
+  catalogRagService?: ProductCatalogRagService;
   env: AppEnv;
 }): Router {
   /**
@@ -29,9 +34,69 @@ export function createConversationRouter(deps: {
    */
   const router = Router();
   const { conversationalAgentService, env } = deps;
+  const catalogRagService = deps.catalogRagService || new ProductCatalogRagService(env);
 
   // Support Twilio's application/x-www-form-urlencoded webhook payloads
   router.use(express.urlencoded({ extended: false }));
+
+  // ==========================================================================
+  // PHASE 2: MULTI-CATEGORY PRODUCT CATALOG & CSV RAG INGESTION ENDPOINTS
+  // ==========================================================================
+  router.get('/catalog', requireAuth(env), (req, res) => {
+    const tenantId = resolveScopedTenantId(req) || DEMO_TENANT_A_ID;
+    if (tenantId === '__FORBIDDEN__') {
+      res.status(403).json({ error: 'Cross-tenant access denied' });
+      return;
+    }
+    const products = catalogRagService.listCatalog(tenantId);
+    res.json({
+      tenantId,
+      count: products.length,
+      attributeLabels: ATTRIBUTE_BANGLA_LABELS,
+      products,
+    });
+  });
+
+  router.get('/catalog/sample-csv', requireAuth(env), (_req, res) => {
+    const csv = catalogRagService.getSampleCsvContent();
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="bd_multi_category_products.csv"');
+    res.send(csv);
+  });
+
+  router.post('/catalog/ingest-csv', requireAuth(env), (req, res) => {
+    const tenantId = resolveScopedTenantId(req) || DEMO_TENANT_A_ID;
+    if (tenantId === '__FORBIDDEN__') {
+      res.status(403).json({ error: 'Cross-tenant access denied' });
+      return;
+    }
+    const csvContent = String(req.body?.csvContent || '').trim();
+    const replaceExisting = Boolean(req.body?.replaceExisting);
+    if (!csvContent) {
+      res.status(400).json({ error: 'csvContent is required' });
+      return;
+    }
+    const products = catalogRagService.ingestCsvForTenant(tenantId, csvContent, replaceExisting);
+    // Sync uploaded CSV to the Python Real-Time AI Agent (:8001) asynchronously
+    const pyUrl = (process.env.PYTHON_AI_AGENT_URL || 'http://127.0.0.1:8001').replace(/\/$/, '');
+    fetch(`${pyUrl}/api/v1/knowledge/ingest-csv`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tenant_id: tenantId,
+        csv_content: csvContent,
+        replace_existing: replaceExisting,
+      }),
+      signal: AbortSignal.timeout(3000),
+    }).catch(() => {});
+
+    res.status(201).json({
+      tenantId,
+      ingestedCount: products.length,
+      attributeLabels: ATTRIBUTE_BANGLA_LABELS,
+      products,
+    });
+  });
 
   router.post('/start', requireAuth(env), async (req, res, next) => {
     /**

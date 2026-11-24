@@ -130,13 +130,28 @@ export class ShopifyStoreAdapter extends BaseStoreAdapter implements StoreAdapte
         // Developer Note: Shopify combines colour and size into `variant_title` (e.g., "নীল / XL"). We split them here.
         const variantStr = li.variant_title ? String(li.variant_title) : null;
         const parsed = parseVariantAttributes(variantStr);
+        const colourVal = li.colour ? String(li.colour) : parsed.colour;
+        const sizeVal = li.size ? String(li.size) : parsed.size;
+        const attrs: Record<string, string | number | null> = {};
+        if (colourVal) attrs.colour = colourVal;
+        if (sizeVal) attrs.size = sizeVal;
+        if (Array.isArray(li.properties)) {
+          for (const prop of li.properties as Record<string, unknown>[]) {
+            if (prop.name && prop.value != null) {
+              attrs[String(prop.name)] = String(prop.value);
+            }
+          }
+        }
         return {
           productName: String(li.title ?? li.name ?? 'পণ্য'),
           variant: variantStr,
-          colour: li.colour ? String(li.colour) : parsed.colour,
-          size: li.size ? String(li.size) : parsed.size,
+          colour: colourVal,
+          size: sizeVal,
           quantity: Number(li.quantity ?? 1),
           unitPrice: Number(li.price ?? 0),
+          sku: li.sku ? String(li.sku) : null,
+          category: li.product_type ? String(li.product_type) : null,
+          attributes: Object.keys(attrs).length > 0 ? attrs : null,
         };
       }),
     };
@@ -197,13 +212,25 @@ export class WooCommerceStoreAdapter extends BaseStoreAdapter implements StoreAd
           const hit = meta.find((m) => String(m.key ?? '').toLowerCase().includes(key));
           return hit?.value ? String(hit.value) : null;
         };
+        const attrs: Record<string, string | number | null> = {};
+        for (const m of meta) {
+          if (m.key && m.value != null && !String(m.key).startsWith('_')) {
+            attrs[String(m.key)] = String(m.value);
+          }
+        }
+        const colourVal = li.colour ? String(li.colour) : findMeta('color') || findMeta('colour');
+        const sizeVal = li.size ? String(li.size) : findMeta('size');
+        if (colourVal && !attrs.colour) attrs.colour = colourVal;
+        if (sizeVal && !attrs.size) attrs.size = sizeVal;
         return {
           productName: String(li.name ?? 'পণ্য'),
           variant: li.variant ? String(li.variant) : null,
-          colour: li.colour ? String(li.colour) : findMeta('color') || findMeta('colour'),
-          size: li.size ? String(li.size) : findMeta('size'),
+          colour: colourVal,
+          size: sizeVal,
           quantity: Number(li.quantity ?? 1),
           unitPrice: Number(li.price ?? li.total ?? 0),
+          sku: li.sku ? String(li.sku) : null,
+          attributes: Object.keys(attrs).length > 0 ? attrs : null,
         };
       }),
     };
@@ -253,14 +280,49 @@ export class CustomStoreAdapter extends BaseStoreAdapter implements StoreAdapter
       currency: String(body.currency ?? 'BDT'),
       orderStatus: String(body.orderStatus ?? body.status ?? 'pending').toLowerCase(),
       consentGranted: body.consentGranted === undefined ? true : Boolean(body.consentGranted),
-      items: items.map((item) => ({
-        productName: String(item.productName ?? item.product_name ?? item.name ?? 'পণ্য'),
-        variant: item.variant ? String(item.variant) : null,
-        colour: item.colour ? String(item.colour) : item.color ? String(item.color) : null,
-        size: item.size ? String(item.size) : null,
-        quantity: Number(item.quantity ?? 1),
-        unitPrice: Number(item.unitPrice ?? item.unit_price ?? item.price ?? 0),
-      })),
+      items: items.map((item) => {
+        const rawAttrs =
+          item.attributes && typeof item.attributes === 'object'
+            ? (item.attributes as Record<string, string | number | null>)
+            : {};
+        const colourVal = item.colour
+          ? String(item.colour)
+          : item.color
+          ? String(item.color)
+          : rawAttrs.colour
+          ? String(rawAttrs.colour)
+          : null;
+        const sizeVal = item.size
+          ? String(item.size)
+          : rawAttrs.size
+          ? String(rawAttrs.size)
+          : rawAttrs.screen_size_inch
+          ? String(rawAttrs.screen_size_inch)
+          : rawAttrs.capacity_gb
+          ? String(rawAttrs.capacity_gb)
+          : null;
+        const mergedAttrs: Record<string, string | number | null> = { ...rawAttrs };
+        if (colourVal && !mergedAttrs.colour) mergedAttrs.colour = colourVal;
+        if (sizeVal && !mergedAttrs.size) mergedAttrs.size = sizeVal;
+        const autoVariant =
+          item.variant
+            ? String(item.variant)
+            : Object.entries(mergedAttrs)
+                .filter(([, v]) => v != null && String(v).trim() !== '')
+                .map(([k, v]) => `${k}: ${v}`)
+                .join(' · ') || null;
+        return {
+          productName: String(item.productName ?? item.product_name ?? item.name ?? 'পণ্য'),
+          variant: autoVariant,
+          colour: colourVal,
+          size: sizeVal,
+          quantity: Number(item.quantity ?? 1),
+          unitPrice: Number(item.unitPrice ?? item.unit_price ?? item.price ?? 0),
+          sku: item.sku ? String(item.sku) : null,
+          category: item.category ? String(item.category) : null,
+          attributes: Object.keys(mergedAttrs).length > 0 ? mergedAttrs : null,
+        };
+      }),
     };
   }
 }

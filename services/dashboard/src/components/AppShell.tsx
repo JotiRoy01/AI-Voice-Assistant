@@ -7,10 +7,12 @@ import {
   Activity,
   AlertTriangle,
   BarChart3,
+  Database,
   LogOut,
   Mic,
   PhoneCall,
   PlayCircle,
+  Radio,
   Settings,
   ShieldCheck,
 } from 'lucide-react';
@@ -18,7 +20,9 @@ import { useAuth } from './AuthContext';
 
 const NAV_ITEMS = [
   { href: '/', label: 'Overview & Usage', icon: BarChart3 },
-  { href: '/live-agent', label: 'Live AI Voice Call (Talk)', icon: Mic },
+  { href: '/realtime-voice', label: 'Real-Time Voice (Barge-In)', icon: Radio },
+  { href: '/live-agent', label: 'Live AI Voice Call (Classic)', icon: Mic },
+  { href: '/catalog', label: 'Product Catalog & RAG CSV', icon: Database },
   { href: '/simulator', label: 'Webhook & IVR Test Bench', icon: PlayCircle },
   { href: '/calls', label: 'Call History', icon: PhoneCall },
   { href: '/settings', label: 'Voice Settings', icon: Settings },

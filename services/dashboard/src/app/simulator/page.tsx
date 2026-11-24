@@ -1,18 +1,45 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import Link from 'next/link';
 import {
   CheckCircle2,
+  Database,
   MessageSquare,
   PhoneCall,
+  Plus,
   Send,
+  Trash2,
   Volume2,
   XCircle,
 } from 'lucide-react';
 import { useAuth } from '@/components/AuthContext';
 import { StatusBadge } from '@/components/StatusBadge';
 import { apiFetch } from '@/lib/api';
+
+interface ProductCatalogEntry {
+  id: string;
+  sku: string;
+  productName: string;
+  banglaName: string;
+  category: string;
+  unitPrice: number;
+  currency: string;
+  requiredAttributes: string[];
+  attributeOptions: Record<string, string[]>;
+}
+
+interface OrderCartRow {
+  rowId: string;
+  sku: string;
+  productName: string;
+  category: string;
+  unitPrice: number;
+  quantity: number;
+  requiredAttributes: string[];
+  attributeOptions: Record<string, string[]>;
+  attributes: Record<string, string>;
+}
 
 interface SimOrderResponse {
   accepted: boolean;
@@ -41,19 +68,21 @@ interface SimTelephonyResponse {
 export default function SimulatorTestBenchPage() {
   const { token, activeTenantId } = useAuth();
 
-  // Pre-filled with SRS Section 3.1 exact Bangla example
+  const [catalog, setCatalog] = useState<ProductCatalogEntry[]>([]);
+  const [attributeLabels, setAttributeLabels] = useState<Record<string, string>>({});
+
   const [provider, setProvider] = useState<'custom' | 'shopify' | 'woocommerce'>('custom');
   const [externalOrderId, setExternalOrderId] = useState(`DF-${Math.floor(2000 + Math.random() * 7000)}`);
-  const [customerName, setCustomerName] = useState('Tanvir Ahmed');
+  const [customerName, setCustomerName] = useState('Joti Roy');
   const [phone, setPhone] = useState('01712345678');
-  const [productName, setProductName] = useState('প্যান্ট');
-  const [colour, setColour] = useState('কালো');
-  const [size, setSize] = useState('36');
-  const [quantity, setQuantity] = useState(1);
-  const [totalAmount, setTotalAmount] = useState(1500);
+
+  // Dynamic Multi-Product Shopping Cart (Each row renders its own product-specific required attributes!)
+  const [cartRows, setCartRows] = useState<OrderCartRow[]>([]);
 
   const [activeOrderId, setActiveOrderId] = useState<string | null>(null);
-  const [activeCall, setActiveCall] = useState<SimOrderResponse['calls'] extends (infer U)[] | undefined ? U | null : never>(null);
+  const [activeCall, setActiveCall] = useState<
+    SimOrderResponse['calls'] extends (infer U)[] | undefined ? U | null : never
+  >(null);
   const [lastDtmfResponse, setLastDtmfResponse] = useState<SimTelephonyResponse | null>(null);
   const [waMessage, setWaMessage] = useState('অনুগ্রহ করে সন্ধ্যা ৬টার পর বাড্ডা লিংক রোডে ডেলিভারি দিবেন।');
   const [waResult, setWaResult] = useState<string | null>(null);
@@ -63,9 +92,91 @@ export default function SimulatorTestBenchPage() {
   const appendLog = (entry: string) =>
     setLog((prev) => [`[${new Date().toLocaleTimeString()}] ${entry}`, ...prev]);
 
+  const buildCartRowFromCatalogItem = (item: ProductCatalogEntry): OrderCartRow => {
+    const initialAttrs: Record<string, string> = {};
+    for (const reqAttr of item.requiredAttributes) {
+      const opts = item.attributeOptions?.[reqAttr];
+      initialAttrs[reqAttr] = opts && opts.length > 0 ? opts[0].split(' (')[0] : '';
+    }
+    return {
+      rowId: `row-${Math.random().toString(36).slice(2, 8)}`,
+      sku: item.sku,
+      productName: item.banglaName || item.productName,
+      category: item.category,
+      unitPrice: item.unitPrice,
+      quantity: 1,
+      requiredAttributes: item.requiredAttributes,
+      attributeOptions: item.attributeOptions || {},
+      attributes: initialAttrs,
+    };
+  };
+
+  useEffect(() => {
+    if (!token || !activeTenantId) return;
+    apiFetch<{
+      attributeLabels: Record<string, string>;
+      products: ProductCatalogEntry[];
+    }>('/api/conversation/catalog', { token, tenantId: activeTenantId })
+      .then((res) => {
+        setCatalog(res.products);
+        setAttributeLabels(res.attributeLabels || {});
+        if (res.products.length > 0 && cartRows.length === 0) {
+          setCartRows([buildCartRowFromCatalogItem(res.products[0])]);
+        }
+      })
+      .catch(() => {});
+  }, [token, activeTenantId]);
+
+  const handleSelectProductForRow = (rowId: string, sku: string) => {
+    const found = catalog.find((c) => c.sku === sku);
+    if (!found) return;
+    const replacement = buildCartRowFromCatalogItem(found);
+    setCartRows((prev) =>
+      prev.map((r) => (r.rowId === rowId ? { ...replacement, rowId } : r))
+    );
+  };
+
+  const handleAttributeChange = (rowId: string, attrKey: string, val: string) => {
+    setCartRows((prev) =>
+      prev.map((r) =>
+        r.rowId === rowId
+          ? { ...r, attributes: { ...r.attributes, [attrKey]: val } }
+          : r
+      )
+    );
+  };
+
+  const handleQuantityChange = (rowId: string, qty: number) => {
+    setCartRows((prev) =>
+      prev.map((r) => (r.rowId === rowId ? { ...r, quantity: Math.max(1, qty) } : r))
+    );
+  };
+
+  const handleUnitPriceChange = (rowId: string, price: number) => {
+    setCartRows((prev) =>
+      prev.map((r) => (r.rowId === rowId ? { ...r, unitPrice: Math.max(0, price) } : r))
+    );
+  };
+
+  const addAnotherProductRow = () => {
+    if (catalog.length === 0) return;
+    const nextCat = catalog[cartRows.length % catalog.length];
+    setCartRows((prev) => [...prev, buildCartRowFromCatalogItem(nextCat)]);
+  };
+
+  const removeProductRow = (rowId: string) => {
+    if (cartRows.length <= 1) return;
+    setCartRows((prev) => prev.filter((r) => r.rowId !== rowId));
+  };
+
+  const computedTotalAmount = cartRows.reduce(
+    (sum, r) => sum + r.quantity * r.unitPrice,
+    0
+  );
+
   const fireOrderWebhook = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!token || !activeTenantId) return;
+    if (!token || !activeTenantId || cartRows.length === 0) return;
     setBusy(true);
     setLastDtmfResponse(null);
     setWaResult(null);
@@ -74,42 +185,53 @@ export default function SimulatorTestBenchPage() {
       if (provider === 'shopify') {
         payload = {
           name: externalOrderId,
-          total_price: String(totalAmount),
+          total_price: String(computedTotalAmount),
           currency: 'BDT',
           customer: { first_name: customerName, phone },
-          line_items: [
-            { title: productName, variant_title: `${colour} / ${size}`, quantity, price: String(totalAmount) },
-          ],
+          line_items: cartRows.map((r) => ({
+            sku: r.sku,
+            product_type: r.category,
+            title: r.productName,
+            variant_title: `${r.attributes.colour || ''} / ${r.attributes.size || ''}`.replace(/^[\s/]+|[\s/]+$/g, '') || null,
+            quantity: r.quantity,
+            price: String(r.unitPrice),
+            properties: Object.entries(r.attributes).map(([name, value]) => ({ name, value })),
+          })),
         };
       } else if (provider === 'woocommerce') {
         payload = {
           number: externalOrderId,
-          total: String(totalAmount),
+          total: String(computedTotalAmount),
           currency: 'BDT',
           status: 'pending',
           billing: { first_name: customerName, phone },
-          line_items: [
-            {
-              name: productName,
-              quantity,
-              price: totalAmount,
-              meta_data: [
-                { key: 'colour', value: colour },
-                { key: 'size', value: size },
-              ],
-            },
-          ],
+          line_items: cartRows.map((r) => ({
+            sku: r.sku,
+            name: r.productName,
+            quantity: r.quantity,
+            price: r.unitPrice,
+            meta_data: Object.entries(r.attributes).map(([key, value]) => ({ key, value })),
+          })),
         };
       } else {
         payload = {
           externalOrderId,
           customerName,
           phone,
-          totalAmount: Number(totalAmount),
+          totalAmount: computedTotalAmount,
           currency: 'BDT',
           orderStatus: 'pending',
           consentGranted: true,
-          items: [{ productName, colour, size, quantity: Number(quantity), unitPrice: Number(totalAmount) }],
+          items: cartRows.map((r) => ({
+            sku: r.sku,
+            category: r.category,
+            productName: r.productName,
+            colour: r.attributes.colour || null,
+            size: r.attributes.size || r.attributes.screen_size_inch || r.attributes.capacity_gb || null,
+            quantity: Number(r.quantity),
+            unitPrice: Number(r.unitPrice),
+            attributes: r.attributes,
+          })),
         };
       }
 
@@ -126,7 +248,7 @@ export default function SimulatorTestBenchPage() {
       const call = res.calls?.[0] || null;
       setActiveCall(call);
       appendLog(
-        `Signed ${provider.toUpperCase()} webhook accepted (${res.duplicate ? 'DUPLICATE' : 'NEW'}) → Call ID: ${call?.providerCallId || 'none'}`
+        `Signed ${provider.toUpperCase()} multi-item webhook (${cartRows.length} products) accepted via storeAdapters.ts → Call ID: ${call?.providerCallId || 'none'}`
       );
       setExternalOrderId(`DF-${Math.floor(2000 + Math.random() * 7000)}`);
     } catch (err) {
@@ -192,25 +314,36 @@ export default function SimulatorTestBenchPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-slate-900">Webhook & IVR DTMF Test Bench</h1>
-        <p className="text-sm text-slate-500">
-          Zero-carrier-cost end-to-end verification workbench: fire real HMAC-signed store webhooks, hear Bangla TTS audio, press DTMF 1/2/3, and test WhatsApp order matching
-        </p>
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold text-slate-900">
+            Multi-Category Order Webhook &amp; IVR DTMF Test Bench
+          </h1>
+          <p className="text-sm text-slate-500">
+            Select any product type (Shirt, Pant, RAM, Monitor, Keyboard, Mouse, Phone, Grocery) — the form dynamically renders that product&apos;s required purchase attributes and sends them through <code>storeAdapters.ts</code>!
+          </p>
+        </div>
+        <Link
+          href="/catalog"
+          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-indigo-50 border border-indigo-200 hover:bg-indigo-100 text-xs font-semibold text-indigo-800"
+        >
+          <Database className="w-3.5 h-3.5" />
+          Manage Product Catalog &amp; Upload CSV →
+        </Link>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Step 1: Fire Signed Order-Created Webhook */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
+        {/* Step 1: Fire Signed Multi-Product Order-Created Webhook */}
         <form
           onSubmit={fireOrderWebhook}
           className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm space-y-4"
         >
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-bold text-slate-900">
-              1. Simulate Signed E-commerce Order Webhook
+              1. Simulate Signed Multi-Product E-commerce Order
             </h2>
             <span className="text-[11px] font-mono bg-slate-100 px-2 py-0.5 rounded text-slate-600">
-              POST /api/webhooks/orders/:provider
+              storeAdapters.ts
             </span>
           </div>
 
@@ -254,41 +387,146 @@ export default function SimulatorTestBenchPage() {
                 className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
               />
             </div>
-            <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">Product Name (Bangla)</label>
-              <input
-                value={productName}
-                onChange={(e) => setProductName(e.target.value)}
-                required
-                className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
-              />
+          </div>
+
+          {/* Dynamic Multi-Product Cart Items */}
+          <div className="space-y-3 pt-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                Order Line Items ({cartRows.length} {cartRows.length === 1 ? 'Product' : 'Products'})
+              </span>
+              <button
+                type="button"
+                onClick={addAnotherProductRow}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-xs font-semibold"
+              >
+                <Plus className="w-3.5 h-3.5" /> Add Another Product
+              </button>
             </div>
-            <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">Colour</label>
-              <input
-                value={colour}
-                onChange={(e) => setColour(e.target.value)}
-                className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">Size</label>
-              <input
-                value={size}
-                onChange={(e) => setSize(e.target.value)}
-                className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">Payable Total (BDT)</label>
-              <input
-                type="number"
-                value={totalAmount}
-                onChange={(e) => setTotalAmount(Number(e.target.value))}
-                required
-                className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
-              />
-            </div>
+
+            {cartRows.map((row, idx) => (
+              <div
+                key={row.rowId}
+                className="p-3.5 rounded-xl bg-slate-50 border border-slate-200/90 space-y-3"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="px-2 py-0.5 rounded bg-indigo-600 text-white text-[10px] font-bold">
+                      Item #{idx + 1}
+                    </span>
+                    <span className="text-[11px] font-semibold text-slate-500">
+                      Category: {row.category} · SKU: {row.sku}
+                    </span>
+                  </div>
+                  {cartRows.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={() => removeProductRow(row.rowId)}
+                      className="text-rose-600 hover:text-rose-800 p-1"
+                      title="Remove item"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                {/* Product Selector + Qty + Unit Price */}
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-2.5">
+                  <div className="md:col-span-2">
+                    <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                      Select Product from Company Catalog
+                    </label>
+                    <select
+                      value={row.sku}
+                      onChange={(e) => handleSelectProductForRow(row.rowId, e.target.value)}
+                      className="w-full px-2.5 py-1.5 text-xs font-semibold border border-slate-300 rounded-lg bg-white"
+                    >
+                      {catalog.map((c) => (
+                        <option key={c.sku} value={c.sku}>
+                          {c.banglaName} — {c.productName} (৳{c.unitPrice})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                      Quantity
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      value={row.quantity}
+                      onChange={(e) => handleQuantityChange(row.rowId, Number(e.target.value))}
+                      className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg bg-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                      Unit Price (BDT)
+                    </label>
+                    <input
+                      type="number"
+                      value={row.unitPrice}
+                      onChange={(e) => handleUnitPriceChange(row.rowId, Number(e.target.value))}
+                      className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg bg-white"
+                    />
+                  </div>
+                </div>
+
+                {/* Product-Specific Required Attributes Rendered Dynamically! */}
+                <div className="pt-1 border-t border-slate-200/70">
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-indigo-600 mb-2">
+                    Required Purchase Specifications for {row.productName}:
+                  </div>
+                  <div className="grid grid-cols-2 gap-2.5">
+                    {row.requiredAttributes.map((attrKey) => {
+                      const opts = row.attributeOptions?.[attrKey] || [];
+                      return (
+                        <div key={attrKey}>
+                          <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                            {attributeLabels[attrKey] || attrKey}
+                          </label>
+                          {opts.length > 0 ? (
+                            <select
+                              value={row.attributes[attrKey] || ''}
+                              onChange={(e) =>
+                                handleAttributeChange(row.rowId, attrKey, e.target.value)
+                              }
+                              className="w-full px-2.5 py-1.5 text-xs border border-indigo-200 rounded-lg bg-white"
+                            >
+                              {opts.map((opt) => {
+                                const cleanVal = opt.split(' (')[0];
+                                return (
+                                  <option key={opt} value={cleanVal}>
+                                    {opt}
+                                  </option>
+                                );
+                              })}
+                            </select>
+                          ) : (
+                            <input
+                              value={row.attributes[attrKey] || ''}
+                              onChange={(e) =>
+                                handleAttributeChange(row.rowId, attrKey, e.target.value)
+                              }
+                              required
+                              className="w-full px-2.5 py-1.5 text-xs border border-indigo-200 rounded-lg bg-white"
+                            />
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-slate-100 text-xs font-bold text-slate-800">
+            <span>Total Payable Order Amount ({cartRows.length} items):</span>
+            <span className="text-base text-blue-700">
+              ৳{computedTotalAmount.toLocaleString()} BDT
+            </span>
           </div>
 
           <button
@@ -297,7 +535,7 @@ export default function SimulatorTestBenchPage() {
             className="w-full inline-flex items-center justify-center gap-2 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-semibold"
           >
             <PhoneCall className="w-4 h-4" />
-            Send Signed Order Webhook & Initiate Call
+            Send Signed Order Webhook &amp; Initiate Call
           </button>
         </form>
 
@@ -305,7 +543,7 @@ export default function SimulatorTestBenchPage() {
         <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm space-y-4">
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-bold text-slate-900">
-              2. Simulated Customer Phone & DTMF Keypad
+              2. Simulated Customer Phone &amp; DTMF Keypad
             </h2>
             {activeOrderId && (
               <div className="flex items-center gap-3">
@@ -315,7 +553,10 @@ export default function SimulatorTestBenchPage() {
                 >
                   🎙️ Talk with Live AI about This Order →
                 </Link>
-                <Link href={`/orders/${activeOrderId}`} className="text-xs font-semibold text-blue-600 hover:underline">
+                <Link
+                  href={`/orders/${activeOrderId}`}
+                  className="text-xs font-semibold text-blue-600 hover:underline"
+                >
                   View Audit Trail →
                 </Link>
               </div>
@@ -336,12 +577,8 @@ export default function SimulatorTestBenchPage() {
                   <code className="text-[11px]">{activeCall.providerCallId}</code>
                 </div>
                 <p className="text-sm leading-relaxed text-white">{activeCall.promptText}</p>
-                {activeCall.audioUrl ? (
+                {activeCall.audioUrl && (
                   <audio controls className="w-full h-9 mt-2" src={activeCall.audioUrl} />
-                ) : (
-                  <p className="text-[11px] text-amber-300">
-                    Start the Python Bangla TTS microservice on port 8000 to stream real neural Bangla audio here.
-                  </p>
                 )}
               </div>
 

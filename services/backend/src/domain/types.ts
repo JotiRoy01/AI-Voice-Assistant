@@ -95,6 +95,25 @@ export interface OrderItem {
   size: string | null;
   quantity: number;
   unitPrice: number;
+  sku?: string | null;
+  category?: string | null;
+  attributes?: Record<string, string | number | null> | null;
+}
+
+export interface ProductCatalogEntry {
+  id: string;
+  tenantId: string;
+  sku: string;
+  productName: string;
+  banglaName: string;
+  aliases: string[];
+  category: string;
+  unitPrice: number;
+  currency: string;
+  stockQty: number;
+  requiredAttributes: string[];
+  attributeOptions: Record<string, string[]>;
+  description: string;
 }
 
 export interface Order {

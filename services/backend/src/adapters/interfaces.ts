@@ -16,6 +16,9 @@ export interface NormalizedStoreOrder {
     size: string | null;
     quantity: number;
     unitPrice: number;
+    sku?: string | null;
+    category?: string | null;
+    attributes?: Record<string, string | number | null> | null;
   }[];
 }
 

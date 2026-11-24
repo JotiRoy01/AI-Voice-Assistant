@@ -153,3 +153,9 @@ All software layers (**Node.js, MySQL, Redis/BullMQ, n8n, Asterisk, Piper/Edge-T
 npm run dev:backend
 npm run dev:dashboard
 ```
+| Terminal | Command | Port | Needs `conda activate`? |
+| --- | --- | :---: | :---: |
+| Terminal 1 (Backend) | `npm run dev:backend` | `4000` | No (Node.js) |
+| Terminal 2 (Frontend) | `npm run dev:dashboard` | `3000` | No (Next.js) |
+| Terminal 3 (Python AI Agent) | `npm run dev:ai-agent` | `8001` | No — package.json calls `./flowmind/python.exe` directly |
+| Terminal 4 (Persistent TTS) | `npm run dev:tts` | `8000` | No — package.json calls `./flowmind/python.exe` directly |

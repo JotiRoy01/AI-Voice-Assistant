@@ -34,6 +34,38 @@ services:
       timeout: 3s
       retries: 10
 
+  # Phase 3 Real-Time WebRTC Media Edge (Browser + SIP Mobile Bridge)
+  livekit:
+    image: livekit/livekit-server:latest
+    container_name: flowmind-livekit
+    restart: unless-stopped
+    command: --dev --bind 0.0.0.0
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "7882:7882/udp"
+
+  # Phase 3 Python Real-Time Voice Agent (Full-Duplex WebSocket/LiveKit + RAG + Guardrails)
+  ai-agent:
+    image: python:3.11-slim
+    container_name: flowmind-ai-agent
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./services/ai-agent:/app
+    command: sh -c "pip install -q -r requirements.txt edge-tts>=7.2.0 && uvicorn app.main:app --host 0.0.0.0 --port 8001"
+    environment:
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      BACKEND_API_URL: http://backend:4000
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-flowmind-internal-service-token-change-me}
+      LIVEKIT_URL: ws://livekit:7880
+    ports:
+      - "8001:8001"
+    depends_on:
+      - backend
+      - livekit
+
   tts:
     build:
       context: ./services/tts

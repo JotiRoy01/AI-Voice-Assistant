@@ -200,9 +200,21 @@ export class MysqlRepository implements FlowMindRepository {
 
       for (const item of input.items) {
         await conn.execute(
-          `INSERT INTO order_items (id, order_id, product_name, variant, colour, size, quantity, unit_price)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-          [item.id, input.id, item.productName, item.variant, item.colour, item.size, item.quantity, item.unitPrice]
+          `INSERT INTO order_items (id, order_id, product_name, sku, category, variant, colour, size, attributes_json, quantity, unit_price)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            item.id,
+            input.id,
+            item.productName,
+            item.sku ?? null,
+            item.category ?? null,
+            item.variant,
+            item.colour,
+            item.size,
+            item.attributes ? JSON.stringify(item.attributes) : null,
+            item.quantity,
+            item.unitPrice,
+          ]
         );
       }
       await conn.commit();
@@ -716,9 +728,12 @@ export class MysqlRepository implements FlowMindRepository {
       id: r.id,
       orderId: r.order_id,
       productName: r.product_name,
+      sku: r.sku ?? null,
+      category: r.category ?? null,
       variant: r.variant,
       colour: r.colour,
       size: r.size,
+      attributes: parseJsonField<Record<string, string | number | null> | null>(r.attributes_json, null),
       quantity: Number(r.quantity),
       unitPrice: Number(r.unit_price),
     }));

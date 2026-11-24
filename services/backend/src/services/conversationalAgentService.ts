@@ -8,6 +8,12 @@ import { Order } from '../domain/types';
 import { normalizePhoneE164 } from '../security/phone';
 import { logger } from '../utils/logger';
 import { DtmfCallbackService } from './dtmfCallbackService';
+import { GuardrailService, GuardrailViolation } from './guardrailService';
+import {
+  ATTRIBUTE_BANGLA_LABELS,
+  inferAttributesForProduct,
+  ProductCatalogRagService,
+} from './productCatalogRagService';
 
 export type NeuralNodeId =
   | 'caller_voice'
@@ -35,10 +41,15 @@ export interface ConversationMessage {
 }
 
 export interface DraftOrderItem {
+  sku?: string;
+  category?: string;
   productName: string;
   quantityText: string | null;
   quantityNum: number;
   unitPrice: number;
+  requiredAttributes?: string[];
+  collectedAttributes?: Record<string, string>;
+  missingAttributes?: string[];
 }
 
 export interface ConversationSessionState {
@@ -98,12 +109,16 @@ export class ConversationalAgentService {
    * ============================================================================
    */
   private sessions = new Map<string, ConversationSessionState>();
+  private pythonAgentBackoffUntil = 0;
+  private ollamaBackoffUntil = 0;
 
   constructor(
     private readonly repo: FlowMindRepository,
     private readonly ttsAdapter: TtsAdapter,
     private readonly dtmfCallbackService: DtmfCallbackService,
-    private readonly env: AppEnv
+    private readonly env: AppEnv,
+    private readonly catalogRagService: ProductCatalogRagService = new ProductCatalogRagService(env),
+    private readonly guardrailService: GuardrailService = new GuardrailService()
   ) {}
 
   private async synthesizeSafe(
@@ -339,12 +354,156 @@ export class ConversationalAgentService {
     apiKey: string
   ): Promise<string | null> {
     try {
+      // 0. Pre-LLM Input Guardrail (Prompt Injection & Price Tampering Shield)
+      const inputViolation = this.guardrailService.checkInput(userText);
+      if (inputViolation) {
+        state.stageBadge = 'GUARDRAIL · INPUT BLOCKED';
+        return (
+          inputViolation.suggestedReplyBangla ||
+          'দুঃখিত, এই অনুরোধটি গ্রহণ করা সম্ভব নয়। আপনি কোন পণ্যটি অর্ডার করতে চাচ্ছেন বলুন?'
+        );
+      }
+
+      // 1. Try Delegating to Dedicated Phase-2 Python AI Agent Microservice (Port 8001) if running!
+      const pythonAgentUrl = (process.env.PYTHON_AI_AGENT_URL || 'http://127.0.0.1:8001')
+        .replace(/\/$/, '')
+        .replace('://localhost:', '://127.0.0.1:');
+      if (Date.now() >= this.pythonAgentBackoffUntil) {
+        try {
+          const pyRes = await fetch(`${pythonAgentUrl}/api/v1/agent/turn`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            session_id: state.sessionId,
+            tenant_id: state.tenantId,
+            user_text: userText,
+            customer_name: state.customerName,
+            customer_phone: state.customerPhone,
+            previous_orders_summary: state.previousOrdersSummary,
+            saved_address: 'গুলশান ২, ভাটারা, ঢাকা',
+            current_draft_items: state.draftItems.map((d) => ({
+              sku: d.sku || 'CUSTOM',
+              product_name: d.productName,
+              bangla_name: d.productName,
+              category: d.category || 'General',
+              quantity: d.quantityNum,
+              quantity_text: d.quantityText || '১টি',
+              unit_price: d.unitPrice,
+              required_attributes: d.requiredAttributes || [],
+              collected_attributes: d.collectedAttributes || {},
+              missing_attributes: d.missingAttributes || [],
+            })),
+            delivery_method: state.deliveryMethod,
+            delivery_address: state.deliveryAddress,
+            address_verified: state.hasCapturedAddress,
+            recipient_name: state.recipientName,
+            recipient_phone: state.recipientPhone,
+            history_mentioned: state.hasAskedReorderOrNew,
+            already_confirmed: Boolean(state.confirmed || state.stage === 'completed'),
+            conversation_history: state.messages.slice(-10).map((m) => ({
+              role: m.role,
+              text: m.text,
+            })),
+            api_key: apiKey || undefined,
+          }),
+          signal: AbortSignal.timeout(6500),
+        });
+        if (pyRes.ok) {
+          const pyData = (await pyRes.json()) as {
+            reply_bangla: string;
+            stage_badge: string;
+            active_nodes: NeuralNodeId[];
+            draft_items: {
+              sku: string;
+              product_name: string;
+              category: string;
+              quantity: number;
+              quantity_text: string;
+              unit_price: number;
+              required_attributes: string[];
+              collected_attributes: Record<string, string>;
+              missing_attributes: string[];
+            }[];
+            delivery_method: 'delivery' | 'pickup';
+            delivery_address: string;
+            address_verified: boolean;
+            recipient_name: string;
+            recipient_phone: string;
+            confirmed: boolean;
+            should_end_call: boolean;
+            llm_engine_used: string;
+            signals: LiveTraceSignal[];
+          };
+          if (!pyData.llm_engine_used?.includes('fallback-rag-nlu')) {
+            state.stageBadge = pyData.stage_badge;
+            state.activeNodes = pyData.active_nodes;
+            state.hasAskedReorderOrNew = true;
+            state.draftItems = pyData.draft_items.map((item) => ({
+              sku: item.sku,
+              category: item.category,
+              productName: item.product_name,
+              quantityNum: item.quantity,
+              quantityText: item.quantity_text,
+              unitPrice: item.unit_price,
+              requiredAttributes: item.required_attributes,
+              collectedAttributes: item.collected_attributes,
+              missingAttributes: item.missing_attributes,
+            }));
+            if (state.draftItems.length > 0) {
+              state.hasCapturedProducts = true;
+              state.hasCapturedQuantities = true;
+            }
+            state.deliveryMethod = pyData.delivery_method;
+            state.deliveryAddress = pyData.delivery_address;
+            state.hasCapturedAddress = pyData.address_verified;
+            state.recipientName = pyData.recipient_name;
+            state.recipientPhone = pyData.recipient_phone;
+            state.llmEngineUsed = pyData.llm_engine_used;
+            if (pyData.signals && pyData.signals.length > 0) {
+              state.signals = pyData.signals;
+            }
+            if (pyData.confirmed && state.stage !== 'completed') {
+              await this.finalizeConversationalOrder(state);
+            }
+            if (pyData.confirmed) {
+              state.confirmed = true;
+            }
+            if (pyData.should_end_call) {
+              state.shouldEndCall = true;
+            }
+            return pyData.reply_bangla;
+          }
+        }
+        } catch {
+          // Python AI Agent on port 8001 not running; back off 30s and execute built-in RAG + Guardrails seamlessly
+          this.pythonAgentBackoffUntil = Date.now() + 30_000;
+        }
+      }
+
+      // 2. Built-in RAG Catalog Lookup + Dynamic Product Attribute Schema Injection!
+      const fullCatalog = this.catalogRagService.listCatalog(state.tenantId);
+      const matchedCatalog = this.catalogRagService.searchProducts(state.tenantId, userText, 4);
+      const catalogItemsToShow = matchedCatalog.length > 0 ? matchedCatalog : fullCatalog.slice(0, 12);
+
+      const catalogRagContext = catalogItemsToShow
+        .map((c) => {
+          const reqBn = c.requiredAttributes.map(
+            (r) => `${r} (${ATTRIBUTE_BANGLA_LABELS[r] || r})`
+          );
+          return `- SKU: ${c.sku} | Name: ${c.banglaName} (${c.productName}) | Category: ${c.category} | Price: ${c.unitPrice} ${c.currency} | REQUIRED ATTRIBUTES TO COLLECT: [${reqBn.join(', ')}] | Options: ${JSON.stringify(c.attributeOptions)}`;
+        })
+        .join('\n');
+
       const historyText = state.messages
         .slice(-12)
         .map((m) => `${m.role === 'user' ? 'Customer' : 'AI Assistant'}: ${m.text}`)
         .join('\n');
 
-      const systemPrompt = `You are Cogni AI / FlowMind AI, an intelligent, natural Bangladeshi Bangla voice assistant for an e-commerce store.
+      const systemPrompt = `You are Cogni AI / FlowMind AI, an intelligent Bangladeshi Bangla Voice Commerce Agent with RAG & Dynamic Product Attribute Schema Validation.
+
+COMPANY PRODUCT CATALOG & REQUIRED ATTRIBUTES (RETRIEVED VIA RAG):
+${catalogRagContext}
+
 Customer Profile:
 - Name: ${state.customerName}
 - Phone: ${state.customerPhone}
@@ -355,29 +514,47 @@ Current Session Memory:
 - Stage: ${state.stage}
 - Has Mentioned Previous Order History Yet: ${state.hasAskedReorderOrNew}
 - Has Customer Explicitly Confirmed/Modified Delivery Address in This Call Yet: ${state.hasCapturedAddress}
-- Has Customer Explicitly Verified Recipient Name & Phone in This Call Yet: ${state.hasVerifiedRecipient}
-- Captured Items in Current Order: ${JSON.stringify(state.draftItems)}
+- Captured Items & Attributes in Current Order: ${JSON.stringify(state.draftItems)}
 - Delivery Method: ${state.deliveryMethod}
 - Delivery Address: ${state.deliveryAddress}
 - Recipient: ${state.recipientName} (${state.recipientPhone})
 - Is Order Already Confirmed: ${Boolean(state.confirmed)}
 
 CRITICAL STEP-BY-STEP CONVERSATION RULES (DO NOT SKIP STEPS!):
-1. STEP 1 (Older Order History): When the customer first asks to order a product (and "Has Mentioned Previous Order History Yet" is false), tell them their older order details (${state.previousOrdersSummary}) and ask if they want to reorder those or order something new.
-2. STEP 2 (Products & Quantities): Collect the product name(s) and exact quantity for each product. Do NOT jump to final confirmation yet!
-3. STEP 3 (Mandatory Delivery Address Check): Once products and quantities are known, if "Has Customer Explicitly Confirmed/Modified Delivery Address in This Call Yet" is false, you MUST ask: "ডেলিভারি কি আপনার আগের ঠিকানায় (${state.deliveryAddress}) নিবেন, নাকি নতুন কোনো ঠিকানায় পাঠাবো? অথবা স্টোর থেকে পিকআপ করবেন?"
-   - Set "addressVerifiedInThisTurn": true ONLY AFTER the customer answers the address question (either confirming the old address or providing a new address like মনিপুরী পাড়া / বাড্ডা / মিরপুর).
-   - If the customer says they want to change/modify the address ("ঠিকানা পরিবর্তন করব" / "ঠিকানা চেঞ্জ করব") at ANY time (even after confirmation!), ask for their new address and update "address".
-4. STEP 4 (Recipient Name, Phone & Read-Back Summary): Once the address is confirmed or updated, read back the full summary (Products + Quantities + Delivery Address + Recipient Name ${state.recipientName} + Phone ${state.recipientPhone}) and ask: "সব তথ্য কি ঠিক আছে? আমি কি অর্ডারটি কনফার্ম করব?"
-5. STEP 5 (Final Confirmation): Set "confirmed": true ONLY when the customer says "হ্যাঁ কনফার্ম করুন" AFTER hearing the full summary with the delivery address! NEVER set "confirmed": true before the customer has verified their delivery address!
+1. STEP 1 (Older Order History): When the customer first asks to order a product (and "Has Mentioned Previous Order History Yet" is false, and "Previous Order History" is not "কোনো আগের অর্ডার নেই"), tell them their older order details (${state.previousOrdersSummary}) and ask if they want to reorder those or order something new.
+2. STEP 2 (Product-Specific Required Attributes from Catalog!): Look at "REQUIRED ATTRIBUTES TO COLLECT" for each product in the customer's order:
+   - Shirt / Pant / Panjabi -> MUST collect: colour, size (and fit for Shirt)
+   - RAM (র‍্যাম) -> MUST collect: brand (Corsair/Kingston/etc.), ddr_type (DDR4/DDR5), capacity_gb (8GB/16GB/32GB), bus_speed_mhz (3200MHz/5600MHz)
+   - Monitor (মনিটর) -> MUST collect: brand, screen_size_inch (22/24/27 inch), refresh_rate_hz (75Hz/100Hz/144Hz), panel_type (IPS/VA)
+   - Keyboard (কিবোর্ড) -> MUST collect: brand (A4Tech/Logitech/etc.), connection_type (Wired/Wireless), switch_type
+   - Mouse (মাউস) -> MUST collect: brand, connection_type, dpi
+   - Smartphone (ফোন/মোবাইল) -> MUST collect: brand, ram_storage (8GB/128GB), colour, warranty_type
+   - Coconut Oil / Olive Oil / Yellow Booster / Green Tea -> MUST collect: weight_or_volume (500ml / 1 KG / 250g)
+   - Store every attribute the customer provides inside "products[i].attributes" using those exact attribute keys!
+   - If ANY required attribute for a product is still missing, ask for those missing attributes naturally in Bangla BEFORE moving to delivery address!
+3. STEP 3 (Mandatory Delivery Address Check): Once all products, quantities, AND their required attributes are collected, if "Has Customer Explicitly Confirmed/Modified Delivery Address in This Call Yet" is false, ask: "ডেলিভারি কি আপনার আগের ঠিকানায় (${state.deliveryAddress}) নিবেন, নাকি নতুন কোনো ঠিকানায় পাঠাবো? অথবা স্টোর থেকে পিকআপ করবেন?"
+   - Set "addressVerifiedInThisTurn": true ONLY AFTER the customer answers the address question.
+   - If the customer wants to modify the address ("ঠিকানা পরিবর্তন করব") at ANY time, ask for their new address and update "address".
+4. STEP 4 (Read-Back Summary & Final Confirmation): Once all required attributes and the delivery address are verified, read back the full summary (Products + Quantities + All Specs/Attributes + Total BDT Price + Delivery Address + Recipient ${state.recipientName} + Phone ${state.recipientPhone}) and ask: "সব তথ্য কি ঠিক আছে? আমি কি অর্ডারটি কনফার্ম করব?"
+5. STEP 5 (Final Confirmation): Set "confirmed": true ONLY when the customer says "হ্যাঁ কনফার্ম করুন" AFTER all required attributes and delivery address are complete!
 6. Return ONLY valid JSON matching this schema:
 {
   "replyBangla": "string (your spoken response in Bangla, 1-3 short sentences)",
-  "stageBadge": "string (PREVIOUS ORDERS | PRODUCT ORDER | ITEMS AND DELIVERY | ADDRESS UPDATE | CONFIRMATION | REQUEST RECORDED)",
+  "stageBadge": "string (PREVIOUS ORDERS | COLLECTING SPECS | ITEMS AND DELIVERY | ADDRESS UPDATE | CONFIRMATION | REQUEST RECORDED)",
   "activeNodes": ["caller_voice", "intent_router", "context_memory", "entity_parser", "customer_profile", "order_history", "line_items", "delivery_data", "confirmation", "action_executor"],
-  "products": [{"name": "string", "qtyText": "string", "qtyNum": 1, "unitPrice": 1200}],
+  "products": [
+    {
+      "name": "string",
+      "qtyText": "string",
+      "qtyNum": 1,
+      "unitPrice": 1200,
+      "attributes": {
+        "attribute_key": "collected_value"
+      }
+    }
+  ],
   "deliveryMethod": "delivery or pickup",
-  "address": "string (only include if customer confirmed or gave an address)",
+  "address": "string",
   "addressVerifiedInThisTurn": false,
   "recipientName": "string",
   "recipientPhone": "string",
@@ -416,15 +593,22 @@ CRITICAL STEP-BY-STEP CONVERSATION RULES (DO NOT SKIP STEPS!):
           state.llmEngineUsed = model;
         }
       } else if (apiKey) {
-        // Google Gemini (Uses fast 200-OK models verified on user's key: gemini-3.5-flash-lite, gemini-flash-lite-latest, gemini-3.1-flash-lite)
-        const geminiModels = [
-          'gemini-3.5-flash-lite',
-          'gemini-flash-lite-latest',
-          'gemini-3.1-flash-lite',
-          'gemma-4-26b-a4b-it',
+        // Google Gemini (1st: gemini-3.1-flash-lite with thinkingBudget=0 for ~1.2s speed; 2nd: gemini-3.5-flash-lite; 3rd: gemini-flash-lite-latest)
+        const geminiModels: { name: string; disableThinking: boolean }[] = [
+          { name: 'gemini-3.1-flash-lite', disableThinking: true },
+          { name: 'gemini-3.5-flash-lite', disableThinking: false },
+          { name: 'gemini-flash-lite-latest', disableThinking: false },
         ];
-        for (const modelName of geminiModels) {
+        for (const candidate of geminiModels) {
+          const modelName = candidate.name;
           try {
+            const generationConfig: Record<string, unknown> = {
+              responseMimeType: 'application/json',
+              temperature: 0.2,
+            };
+            if (candidate.disableThinking) {
+              generationConfig.thinkingConfig = { thinkingBudget: 0 };
+            }
             const res = await fetch(
               `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`,
               {
@@ -441,16 +625,21 @@ CRITICAL STEP-BY-STEP CONVERSATION RULES (DO NOT SKIP STEPS!):
                       ],
                     },
                   ],
-                  generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
+                  generationConfig,
                 }),
-                signal: AbortSignal.timeout(6000),
+                signal: AbortSignal.timeout(4500),
               }
             );
             if (res.ok) {
               const data = (await res.json()) as {
-                candidates?: { content?: { parts?: { text?: string }[] } }[];
+                candidates?: { content?: { parts?: { text?: string; thought?: boolean }[] } }[];
               };
-              rawJson = data.candidates?.[0]?.content?.parts?.[0]?.text || null;
+              const parts = data.candidates?.[0]?.content?.parts || [];
+              const nonThoughtParts = parts.filter((p) => !p.thought && p.text);
+              rawJson =
+                nonThoughtParts[nonThoughtParts.length - 1]?.text ||
+                parts[parts.length - 1]?.text ||
+                null;
               if (rawJson) {
                 state.llmEngineUsed = modelName;
                 break;
@@ -468,11 +657,15 @@ CRITICAL STEP-BY-STEP CONVERSATION RULES (DO NOT SKIP STEPS!):
         }
       }
 
-      // Optional Local Ollama Fallback (http://localhost:11434) if running on user's PC
-      if (!rawJson && this.env.OLLAMA_BASE_URL) {
+      // Optional Local Ollama Fallback (http://127.0.0.1:11434) with 60s circuit-breaker if not running
+      if (!rawJson && this.env.OLLAMA_BASE_URL && Date.now() >= this.ollamaBackoffUntil) {
+        const ollamaUrl = this.env.OLLAMA_BASE_URL.replace(/\/$/, '').replace(
+          '://localhost:',
+          '://127.0.0.1:'
+        );
         try {
           const ollamaRes = await fetch(
-            `${this.env.OLLAMA_BASE_URL.replace(/\/$/, '')}/api/chat`,
+            `${ollamaUrl}/api/chat`,
             {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -488,7 +681,7 @@ CRITICAL STEP-BY-STEP CONVERSATION RULES (DO NOT SKIP STEPS!):
                   },
                 ],
               }),
-              signal: AbortSignal.timeout(4500),
+              signal: AbortSignal.timeout(1500),
             }
           );
           if (ollamaRes.ok) {
@@ -501,7 +694,8 @@ CRITICAL STEP-BY-STEP CONVERSATION RULES (DO NOT SKIP STEPS!):
             }
           }
         } catch {
-          // Ollama not running locally; fall back to offline NLU
+          // Ollama not running locally; back off 60s and fall back to offline NLU
+          this.ollamaBackoffUntil = Date.now() + 60_000;
         }
       }
 
@@ -515,7 +709,13 @@ CRITICAL STEP-BY-STEP CONVERSATION RULES (DO NOT SKIP STEPS!):
         replyBangla?: string;
         stageBadge?: string;
         activeNodes?: NeuralNodeId[];
-        products?: { name: string; qtyText?: string; qtyNum?: number; unitPrice?: number }[];
+        products?: {
+          name: string;
+          qtyText?: string;
+          qtyNum?: number;
+          unitPrice?: number;
+          attributes?: Record<string, string>;
+        }[];
         deliveryMethod?: 'delivery' | 'pickup';
         address?: string;
         addressVerifiedInThisTurn?: boolean;
@@ -549,17 +749,41 @@ CRITICAL STEP-BY-STEP CONVERSATION RULES (DO NOT SKIP STEPS!):
           if (!state.completedNodes.includes(n)) state.completedNodes.push(n);
         }
       }
+      let catalogViolations: GuardrailViolation[] = [];
       if (parsed.products && parsed.products.length > 0) {
-        state.draftItems = parsed.products.map((p) => ({
-          productName: p.name,
-          quantityText: p.qtyText || '১টি',
-          quantityNum: p.qtyNum || 1,
-          unitPrice: p.unitPrice || 1200,
-        }));
+        const grounded = this.guardrailService.groundAndValidateItems({
+          tenantId: state.tenantId,
+          catalogRagService: this.catalogRagService,
+          rawProducts: parsed.products,
+          existingItems: state.draftItems.map((d) => ({
+            sku: d.sku,
+            category: d.category,
+            productName: d.productName,
+            quantityText: d.quantityText,
+            quantityNum: d.quantityNum,
+            unitPrice: d.unitPrice,
+            requiredAttributes: d.requiredAttributes || [],
+            collectedAttributes: d.collectedAttributes || {},
+            missingAttributes: d.missingAttributes || [],
+          })),
+        });
+        state.draftItems = grounded.items;
+        catalogViolations = grounded.violations;
+
         state.hasCapturedProducts = true;
         state.hasCapturedQuantities = true;
         upsertSignal('Products', state.draftItems.map((i) => i.productName).join(' · '));
         upsertSignal('Quantity', state.draftItems.map((i) => i.quantityText || '১টি').join(' · '));
+
+        const specsStr = state.draftItems
+          .map((i) => {
+            const pairs = Object.entries(i.collectedAttributes || {})
+              .map(([k, v]) => `${k}=${v}`)
+              .join(', ');
+            return `${i.productName}: ${pairs || 'pending'}`;
+          })
+          .join(' | ');
+        upsertSignal('Collected Specs', specsStr);
       }
 
       if (userWantsToChangeAddress && !this.detectAddressInText(userText)) {
@@ -618,15 +842,35 @@ CRITICAL STEP-BY-STEP CONVERSATION RULES (DO NOT SKIP STEPS!):
         upsertSignal('Phone', state.recipientPhone);
       }
 
-      // HARD GUARD: Do NOT allow Gemini to prematurely finalize the order before the delivery address has been verified!
-      if (parsed.confirmed && !state.hasCapturedAddress && !userWantsToChangeAddress) {
-        parsed.confirmed = false;
-        state.stage = 'awaiting_address';
-        state.stageBadge = 'ITEMS AND DELIVERY';
-        const itemsSummary = state.draftItems
-          .map((i) => `${i.productName} (${i.quantityText || '১টি'})`)
-          .join(' এবং ');
-        return `${itemsSummary} নোট করেছি। অর্ডারটি কনফার্ম করার আগে বলুন, ডেলিভারি কি আপনার আগের ঠিকানায় (${state.deliveryAddress}) নিবেন, নাকি নতুন কোনো ঠিকানায় পাঠাবো?`;
+      // Dedicated Anti-Hallucination Output & Confirmation Guardrail Verification (GuardrailService)
+      const verified = this.guardrailService.verifyOutput({
+        replyBangla: parsed.replyBangla || '',
+        confirmed: Boolean(parsed.confirmed),
+        stageBadge: state.stageBadge,
+        draftItems: state.draftItems.map((d) => ({
+          sku: d.sku,
+          category: d.category,
+          productName: d.productName,
+          quantityText: d.quantityText,
+          quantityNum: d.quantityNum,
+          unitPrice: d.unitPrice,
+          requiredAttributes: d.requiredAttributes || [],
+          collectedAttributes: d.collectedAttributes || {},
+          missingAttributes: d.missingAttributes || [],
+        })),
+        hasCapturedAddress: state.hasCapturedAddress,
+        deliveryAddress: state.deliveryAddress,
+        userWantsToChangeAddress,
+        existingViolations: catalogViolations,
+      });
+
+      parsed.replyBangla = verified.replyBangla;
+      parsed.confirmed = verified.confirmed;
+      state.stageBadge = verified.stageBadge;
+      if (verified.violations.length > 0) {
+        upsertSignal('Guardrails', verified.violations.map((v) => v.code).join(', '));
+      } else {
+        upsertSignal('Guardrails', 'PASSED (Zero Hallucinations)');
       }
 
       if (parsed.confirmed && state.stage !== 'completed' && !userWantsToChangeAddress) {
@@ -1342,15 +1586,25 @@ CRITICAL STEP-BY-STEP CONVERSATION RULES (DO NOT SKIP STEPS!):
       orderStatus: 'confirmed',
       verificationStatus: 'confirmed',
       consentGranted: true,
-      items: itemsToSave.map((i) => ({
-        id: crypto.randomUUID(),
-        productName: i.productName,
-        variant: i.quantityText || '১টি',
-        colour: null,
-        size: null,
-        quantity: i.quantityNum,
-        unitPrice: i.unitPrice,
-      })),
+      items: itemsToSave.map((i) => {
+        const attrs = i.collectedAttributes || {};
+        const attrSummary = Object.entries(attrs)
+          .filter(([, v]) => Boolean(v))
+          .map(([k, v]) => `${k}: ${v}`)
+          .join(' · ');
+        return {
+          id: crypto.randomUUID(),
+          sku: i.sku || null,
+          category: i.category || null,
+          productName: i.productName,
+          variant: attrSummary ? `${i.quantityText || '১টি'} · ${attrSummary}` : i.quantityText || '১টি',
+          colour: attrs.colour || attrs.color || null,
+          size: attrs.size || attrs.screen_size_inch || attrs.capacity_gb || null,
+          attributes: Object.keys(attrs).length > 0 ? attrs : null,
+          quantity: i.quantityNum,
+          unitPrice: i.unitPrice,
+        };
+      }),
     });
     await this.repo.updateOrderState(state.tenantId, order.id, { storeSyncStatus: 'synced' });
 

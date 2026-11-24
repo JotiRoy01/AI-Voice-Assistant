@@ -83,17 +83,17 @@ const NEURAL_NODES: {
   row: number;
   col: number;
 }[] = [
-  { id: 'caller_voice', title: 'Caller voice', subtitle: 'Audio stream', row: 1, col: 1 },
-  { id: 'intent_router', title: 'Intent router', subtitle: 'product_order', row: 1, col: 3 },
-  { id: 'context_memory', title: 'Context memory', subtitle: 'Session state', row: 2, col: 1 },
-  { id: 'entity_parser', title: 'Entity parser', subtitle: 'Products', row: 2, col: 3 },
-  { id: 'customer_profile', title: 'Customer profile', subtitle: 'Known caller', row: 3, col: 1 },
-  { id: 'order_history', title: 'Order history', subtitle: '2 prior items', row: 3, col: 2 },
-  { id: 'line_items', title: 'Line items', subtitle: 'Qty + variant', row: 3, col: 3 },
-  { id: 'delivery_data', title: 'Delivery data', subtitle: 'Address + contact', row: 4, col: 1 },
-  { id: 'confirmation', title: 'Confirmation', subtitle: 'Consent captured', row: 4, col: 3 },
-  { id: 'action_executor', title: 'Action executor', subtitle: 'Submit form', row: 5, col: 2 },
-];
+    { id: 'caller_voice', title: 'Caller voice', subtitle: 'Audio stream', row: 1, col: 1 },
+    { id: 'intent_router', title: 'Intent router', subtitle: 'product_order', row: 1, col: 3 },
+    { id: 'context_memory', title: 'Context memory', subtitle: 'Session state', row: 2, col: 1 },
+    { id: 'entity_parser', title: 'Entity parser', subtitle: 'Products', row: 2, col: 3 },
+    { id: 'customer_profile', title: 'Customer profile', subtitle: 'Known caller', row: 3, col: 1 },
+    { id: 'order_history', title: 'Order history', subtitle: '2 prior items', row: 3, col: 2 },
+    { id: 'line_items', title: 'Line items', subtitle: 'Qty + variant', row: 3, col: 3 },
+    { id: 'delivery_data', title: 'Delivery data', subtitle: 'Address + contact', row: 4, col: 1 },
+    { id: 'confirmation', title: 'Confirmation', subtitle: 'Consent captured', row: 4, col: 3 },
+    { id: 'action_executor', title: 'Action executor', subtitle: 'Submit form', row: 5, col: 2 },
+  ];
 
 const QUICK_BANGLA_UTTERANCES: { label: string; text: string }[] = [
   { label: '১. আমি একটা প্রোডাক্ট অর্ডার করতে চাচ্ছি', text: 'আমি একটা প্রোডাক্ট অর্ডার করতে চাচ্ছি।' },
@@ -240,7 +240,7 @@ export default function LiveVoiceAgentPage() {
           selectedOrderIdRef.current = res.orders[0].id;
         }
       })
-      .catch(() => {});
+      .catch(() => { });
   }, [token, activeTenantId]);
 
   useEffect(() => {
@@ -376,14 +376,44 @@ export default function LiveVoiceAgentPage() {
     recognition.lang = 'bn-BD';
     recognition.interimResults = true;
     recognition.continuous = true;
-    recognition.maxAlternatives = 1;
+    recognition.maxAlternatives = 5;
 
     let DispatchedInThisCycle = false;
     let accumulatedFinalTranscript = '';
 
+    // Repairs common Chrome `bn-BD` SpeechRecognition phonetic mishearings for e-commerce words
+    const normalizeBanglaSttTranscript = (raw: string): string => {
+      return raw
+        .replace(
+          /(?:শেষ|ছায়াছবি|ছায়াছবি|চাইজ|সাইস|সাইট)\s*([০-৯0-9]{2}|এম|এল|এক্সএল|m|l|xl)\b/gi,
+          'সাইজ $1'
+        )
+        .replace(/কালার\s*(?:নিয়ে|নিয়ে)/gi, 'কালার')
+        .replace(/করছে\s*আর|কুরসি\s*আর/gi, 'কর্সেয়ার')
+        .replace(/দিদি\s*আর|ডি\s*ডি\s*আর|ভিডিও\s*আর/gi, 'DDR')
+        .trim();
+    };
+
+    const pickBestRecognitionAlternative = (resultItem: {
+      length: number;
+      [idx: number]: { transcript: string };
+    }): string => {
+      const domainKeywordRegex =
+        /সাইজ|কালার|রঙ|পাঞ্জাবি|শার্ট|প্যান্ট|র‍্যাম|র্যাম|মনিটর|কিবোর্ড|মাউস|জিবি|কনফার্ম|ঠিকানা|নেভি|কালো|সাদা|মেরুন|কর্সেয়ার|কিংস্টন|ডেলিভারি|পিকআপ|অর্ডার/i;
+      let bestText = resultItem[0]?.transcript || '';
+      for (let altIdx = 0; altIdx < resultItem.length; altIdx++) {
+        const candidate = resultItem[altIdx]?.transcript || '';
+        if (domainKeywordRegex.test(candidate) && !domainKeywordRegex.test(bestText)) {
+          bestText = candidate;
+          break;
+        }
+      }
+      return normalizeBanglaSttTranscript(bestText);
+    };
+
     const dispatchCapturedSpeech = (textToSend: string) => {
       if (DispatchedInThisCycle) return;
-      const cleaned = textToSend.trim();
+      const cleaned = normalizeBanglaSttTranscript(textToSend);
       if (!cleaned) return;
       DispatchedInThisCycle = true;
       accumulatedFinalTranscript = '';
@@ -407,7 +437,7 @@ export default function LiveVoiceAgentPage() {
       let currentInterim = '';
       let fullFinal = '';
       for (let i = 0; i < event.results.length; i++) {
-        const transcript = event.results[i][0].transcript;
+        const transcript = pickBestRecognitionAlternative(event.results[i]);
         if (event.results[i].isFinal) {
           fullFinal += transcript + ' ';
         } else {
@@ -435,7 +465,7 @@ export default function LiveVoiceAgentPage() {
           if (interimTextRef.current.trim()) {
             dispatchCapturedSpeech(interimTextRef.current);
           }
-        }, 3200);
+        }, 4200);
       }
     };
 
@@ -879,9 +909,8 @@ export default function LiveVoiceAgentPage() {
                     <div className="text-xs text-slate-400 flex items-center gap-1.5">
                       <span>CogniFlow Bangla Voice</span>
                       <span
-                        className={`w-2 h-2 rounded-full ${
-                          callActive ? 'bg-emerald-500 animate-ping' : 'bg-slate-300'
-                        }`}
+                        className={`w-2 h-2 rounded-full ${callActive ? 'bg-emerald-500 animate-ping' : 'bg-slate-300'
+                          }`}
                       />
                     </div>
                   </div>
@@ -889,13 +918,12 @@ export default function LiveVoiceAgentPage() {
 
                 {callActive && (
                   <span
-                    className={`px-2.5 py-1 rounded-full text-[11px] font-semibold border ${
-                      speaking
+                    className={`px-2.5 py-1 rounded-full text-[11px] font-semibold border ${speaking
                         ? 'bg-blue-50 text-blue-700 border-blue-200'
                         : listening
-                        ? 'bg-emerald-50 text-emerald-700 border-emerald-300 animate-pulse'
-                        : 'bg-slate-100 text-slate-700 border-slate-200'
-                    }`}
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-300 animate-pulse'
+                          : 'bg-slate-100 text-slate-700 border-slate-200'
+                      }`}
                   >
                     {speaking ? '🔊 AI Speaking...' : listening ? '🎙️ আপনার কথা শুনছি...' : '● In Call'}
                   </span>
@@ -909,11 +937,10 @@ export default function LiveVoiceAgentPage() {
                   onClick={() => {
                     if (!callActive) startLiveCall();
                   }}
-                  className={`flex items-center justify-center gap-2 py-2 rounded-lg text-xs font-semibold transition ${
-                    !callActive
+                  className={`flex items-center justify-center gap-2 py-2 rounded-lg text-xs font-semibold transition ${!callActive
                       ? 'bg-white text-slate-700 shadow-sm'
                       : 'text-slate-500 hover:text-slate-800'
-                  }`}
+                    }`}
                 >
                   <MessageSquare className="w-3.5 h-3.5" />
                   Message
@@ -928,11 +955,10 @@ export default function LiveVoiceAgentPage() {
                     }
                   }}
                   disabled={busy}
-                  className={`flex items-center justify-center gap-2 py-2 rounded-lg text-xs font-semibold transition ${
-                    callActive
+                  className={`flex items-center justify-center gap-2 py-2 rounded-lg text-xs font-semibold transition ${callActive
                       ? 'bg-white text-indigo-600 border border-indigo-300 shadow-sm'
                       : 'bg-indigo-600 text-white shadow-sm hover:bg-indigo-700'
-                  }`}
+                    }`}
                 >
                   <Phone className="w-3.5 h-3.5" />
                   {callActive ? 'Call Active' : 'Call'}
@@ -974,11 +1000,10 @@ export default function LiveVoiceAgentPage() {
                     className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}
                   >
                     <div
-                      className={`max-w-[85%] rounded-2xl px-4 py-3 text-xs leading-relaxed shadow-sm ${
-                        isUser
+                      className={`max-w-[85%] rounded-2xl px-4 py-3 text-xs leading-relaxed shadow-sm ${isUser
                           ? 'bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-br-none'
                           : 'bg-white border border-slate-200/90 text-slate-800 rounded-bl-none'
-                      }`}
+                        }`}
                     >
                       <p>{msg.text}</p>
                       {!isUser && (
@@ -1094,11 +1119,10 @@ export default function LiveVoiceAgentPage() {
                       }
                     }
                   }}
-                  className={`w-12 h-12 rounded-full flex items-center justify-center shadow-lg transition ${
-                    listening
+                  className={`w-12 h-12 rounded-full flex items-center justify-center shadow-lg transition ${listening
                       ? 'bg-emerald-500 text-white ring-4 ring-emerald-200 animate-pulse'
                       : 'bg-indigo-600 hover:bg-indigo-700 text-white'
-                  }`}
+                    }`}
                   title="Speak in Bangla via Microphone"
                 >
                   {listening ? <Mic className="w-5 h-5" /> : <MicOff className="w-5 h-5" />}
@@ -1142,11 +1166,10 @@ export default function LiveVoiceAgentPage() {
                 <p className="text-xs text-slate-400">Agentic orchestration</p>
               </div>
               <span
-                className={`px-2.5 py-1 rounded text-[10px] font-bold uppercase tracking-wider border ${
-                  busy || speaking || listening
+                className={`px-2.5 py-1 rounded text-[10px] font-bold uppercase tracking-wider border ${busy || speaking || listening
                     ? 'bg-indigo-950/90 border-indigo-500/50 text-indigo-300'
                     : 'bg-slate-900 border-slate-700 text-slate-400'
-                }`}
+                  }`}
               >
                 {busy || speaking || listening ? 'PROCESSING' : session?.stage === 'completed' ? 'PASSED' : 'STANDBY'}
               </span>
@@ -1238,29 +1261,26 @@ function renderNeuralNode(
   return (
     <div
       key={node.id}
-      className={`rounded-xl p-3 border transition-all duration-300 ${
-        isActive
+      className={`rounded-xl p-3 border transition-all duration-300 ${isActive
           ? 'bg-blue-950/90 border-blue-400 shadow-[0_0_20px_rgba(59,130,246,0.35)] scale-[1.02]'
           : isDone
-          ? 'bg-slate-900/90 border-blue-800/70 text-slate-200'
-          : 'bg-slate-900/40 border-slate-800/70 text-slate-500'
-      }`}
+            ? 'bg-slate-900/90 border-blue-800/70 text-slate-200'
+            : 'bg-slate-900/40 border-slate-800/70 text-slate-500'
+        }`}
     >
       <div className="flex items-center justify-between gap-1.5">
         <div className="flex items-center gap-1.5 min-w-0">
           <span
-            className={`w-2 h-2 rounded-full shrink-0 ${
-              isActive
+            className={`w-2 h-2 rounded-full shrink-0 ${isActive
                 ? 'bg-blue-400 animate-ping'
                 : isDone
-                ? 'bg-emerald-400'
-                : 'bg-slate-600'
-            }`}
+                  ? 'bg-emerald-400'
+                  : 'bg-slate-600'
+              }`}
           />
           <span
-            className={`text-xs font-bold truncate ${
-              isActive ? 'text-white' : isDone ? 'text-slate-200' : 'text-slate-400'
-            }`}
+            className={`text-xs font-bold truncate ${isActive ? 'text-white' : isDone ? 'text-slate-200' : 'text-slate-400'
+              }`}
           >
             {node.title}
           </span>
